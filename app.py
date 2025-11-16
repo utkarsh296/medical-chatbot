@@ -1,94 +1,70 @@
-from flask import Flask, render_template, jsonify, request, redirect, url_for
-from flask_cors import CORS
-from dotenv import load_dotenv
+from flask import Flask, render_template, jsonify, request
+from src.helper import download_hugging_face_embeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_openai import ChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from dotenv import load_dotenv
+from src.prompt import *
 import os
-import requests
 
-# Initialize Flask
+
 app = Flask(__name__)
-CORS(app)
 
-# Load environment variables
+
 load_dotenv()
 
-# Clerk keys
-CLERK_FRONTEND_API = os.getenv("CLERK_FRONTEND_API")
-CLERK_API_KEY = os.getenv("CLERK_API_KEY")
-CLERK_PUBLISHABLE_KEY = os.getenv("CLERK_PUBLISHABLE_KEY")
+PINECONE_API_KEY=os.environ.get('PINECONE_API_KEY')
+OPENAI_API_KEY=os.environ.get('OPENAI_API_KEY')
 
-# OpenAI setup
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model="gpt-3.5-turbo")
+os.environ["PINECONE_API_KEY"] = PINECONE_API_KEY
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
-# --------- Clerk Authentication Helper --------- #
-def verify_clerk_token(token):
-    """Verify a Clerk session token."""
-    try:
-        headers = {"Authorization": f"Bearer {token}"}
-        res = requests.get("https://api.clerk.dev/v1/me", headers=headers)
-        return res.status_code == 200
-    except Exception as e:
-        print("❌ Clerk verification error:", e)
-        return False
 
-# --------- Routes --------- #
+embeddings = download_hugging_face_embeddings()
+
+index_name = "medical-chatbot01" 
+# Embed each chunk and upsert the embeddings into your Pinecone index.
+docsearch = PineconeVectorStore.from_existing_index(
+    index_name=index_name,
+    embedding=embeddings
+)
+
+
+
+
+retriever = docsearch.as_retriever(search_type="similarity", search_kwargs={"k":3})
+
+chatModel = ChatOpenAI(model="gpt-4o")
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", system_prompt),
+        ("human", "{input}"),
+    ]
+)
+
+question_answer_chain = create_stuff_documents_chain(chatModel, prompt)
+rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+
+
 @app.route("/")
-def home():
-    return redirect(url_for("chat_page"))
+def index():
+    return render_template('chat.html')
 
-@app.route("/chat")
-def chat_page():
-    return render_template("chat.html", clerk_publishable_key=CLERK_PUBLISHABLE_KEY)
 
-@app.route("/api/chat", methods=["POST"])
+
+@app.route("/get", methods=["GET", "POST"])
 def chat():
-    try:
-        # Verify Clerk token
-        auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
-            return jsonify({"reply": "Unauthorized — missing Clerk token."}), 401
-
-        token = auth_header.split(" ")[1]
-        if not verify_clerk_token(token):
-            return jsonify({"reply": "Invalid or expired Clerk token."}), 403
-
-        # Get message
-        data = request.get_json()
-        user_message = data.get("message", "").strip()
-
-        if not user_message:
-            return jsonify({"reply": "Please enter a valid question."})
-
-        # Create prompt
-        messages = [
-            SystemMessage(content=(
-                "You are MedAssist, a trusted medical assistant chatbot. "
-                "Provide accurate, safe, non-diagnostic medical information, "
-                "and suggest seeing a doctor when appropriate."
-            )),
-            HumanMessage(content=user_message)
-        ]
-
-        # Get response from OpenAI
-        ai_response = llm.invoke(messages)
-
-        # Safely extract reply text
-        reply_text = getattr(ai_response, "content", None)
-        if not reply_text:
-            reply_text = getattr(ai_response, "text", None)
-        if not reply_text:
-            reply_text = str(ai_response)
-
-        print(f"✅ AI Reply: {reply_text}")  # Debugging output
-
-        return jsonify({"reply": reply_text})
-
-    except Exception as e:
-        print("❌ Error in /api/chat:", str(e))
-        return jsonify({"reply": f"Internal Server Error: {str(e)}"}), 500
+    msg = request.form["msg"]
+    input = msg
+    print(input)
+    response = rag_chain.invoke({"input": msg})
+    print("Response : ", response["answer"])
+    return str(response["answer"])
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=True)
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port= 5001, debug= True)
